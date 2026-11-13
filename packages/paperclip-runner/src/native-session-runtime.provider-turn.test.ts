@@ -42,6 +42,20 @@ const result: PrpStructuredRunResult = {
   artifacts: [],
 };
 
+const planReviewWait: PrpStructuredRunResult = {
+  schema: "paperclip.run_result.v1",
+  reportedWorkDisposition: "yielded",
+  summary: "Waiting for the plan review.",
+  completionClaim: { contractRevision: "1", objectiveSatisfied: false,
+    criteria: [{ criterionId: "objective", status: "unknown", evidenceRefs: ["interaction:plan"] }],
+    remainingWork: [{ description: "Resume after the plan review.", blocksCompletion: true }] },
+  evidence: [{ ref: "interaction:plan" }],
+  verification: [],
+  attentionRequests: [],
+  artifacts: [{ kind: "issue_thread_interaction", ref: "interaction:plan" }],
+  continuation: { kind: "response_wake", summary: "Resume from the plan review.", idempotencyKey: "interaction-response:plan" },
+};
+
 let sequence = 0;
 const event = (turnId: string, eventType: PrpEvent["eventType"], payload: Record<string, unknown> = {}): PrpEvent => {
   sequence += 1;
@@ -119,11 +133,12 @@ async function run(options: {
   after?: (control: ReturnType<typeof harness>, appended: PrpEvent[]) => Promise<void> | void;
   providerTurnWait?: ProviderTurnWaitOptions;
   turnTimeoutMs?: number;
+  missingResult?: (input: { turnId: string | null; terminalEvent: PrpEvent }) => PrpStructuredRunResult | null;
 }) {
   const control = harness();
   const appended: PrpEvent[] = [];
   const completeRun = vi.fn(async () => undefined);
-  const resolveMissingResult = vi.fn(async () => null);
+  const resolveMissingResult = vi.fn(async (value: { turnId: string | null; terminalEvent: PrpEvent }) => options.missingResult?.(value) ?? null);
   control.push(...options.stream);
   const capabilities = { resume: false, typedEvents: true, steering: false, interruption: true, structuredResult: true };
   const started = Date.now();
@@ -300,6 +315,38 @@ describe("the controller consumer with provider-started turn sequences", () => {
     expect(outcome.outcome).toContain("native_finalization_missing");
     expect(outcome.appended.filter(value => value.eventType === "run.terminal")).toHaveLength(1);
     expect(outcome.resolveMissingResult).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("settles a plan proposed in the provider-started turn as the plan review wait (cap passed during the turn: %s)", async (capPassed) => {
+    let seen: PrpEvent[] = [];
+    const outcome = await run({
+      stream: turnOne(true), providerTurnWait: { capMs: capPassed ? 100 : 60_000 },
+      missingResult: ({ terminalEvent }) => seen.some(value => value.eventType === "plan.proposed")
+        && terminalEvent.eventType === "turn.completed" ? planReviewWait : null,
+      after: async (control, appended) => {
+        seen = appended;
+        control.push(event("provider-1", "turn.started", { status: "inProgress", origin: "provider" }));
+        await waitFor(() => appended.some(value => value.payload.origin === "provider"));
+        if (capPassed) await new Promise(resolve => setTimeout(resolve, 250));
+        control.push(
+          event("provider-1", "plan.proposed", { schema: "paperclip.plan.proposed.v1", proposalId: "toolu_plan", status: "completed",
+            markdown: "# Plan\n\n1. Install.\n2. Test.", source: "claude_exit_plan_mode" }),
+          event("provider-1", "item.completed", usage),
+          event("provider-1", "turn.completed", { status: "completed", error: null }),
+          event("provider-1", "run.terminal", { schema: "paperclip.prp.terminal.v1", status: "succeeded", turnTerminalState: "completed",
+            runTerminalState: "succeeded", reportedWorkDisposition: "done", provider: "acpx" }),
+        );
+      },
+    });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.interrupt).not.toHaveBeenCalled();
+    expect(outcome.appended.filter(value => value.eventType === "plan.proposed")).toEqual([expect.objectContaining({ turnId: "provider-1", payload: expect.objectContaining({ status: "completed" }) })]);
+    expect(outcome.resolveMissingResult).toHaveBeenCalledOnce();
+    expect(outcome.resolveMissingResult).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: "provider-1", terminalEvent: expect.objectContaining({ eventType: "turn.completed", turnId: "provider-1" }) }));
+    expect(outcome.resolveMissingResult.mock.calls[0]![0].terminalEvent.payload).not.toHaveProperty("awaitingProviderTurn");
+    expect((outcome.completeRun.mock.calls[0] as unknown[])[0]).toMatchObject({ result: planReviewWait, turnId: "provider-1",
+      terminal: { runTerminalState: "succeeded", reportedWorkDisposition: "yielded" } });
   });
 
   it("fails the run as today when the Runner's stream ends during the wait", async () => {
