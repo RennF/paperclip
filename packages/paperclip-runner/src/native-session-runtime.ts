@@ -1400,6 +1400,7 @@ async function consumeTurn(
     const endProviderTurnWait = async (terminal: PrpEvent) => {
       if (providerTurnWait.ending !== null && semanticResultProposal === null && governedResult === null &&
           inputTimers.size === 0 && await resumeInterruptedTurn?.(terminal, appendAbort.signal)) return null;
+      await settlePendingDeltas();
       return { event: terminal, eventCount, highestContiguousSourceSeq, governedResult };
     };
     while (true) {

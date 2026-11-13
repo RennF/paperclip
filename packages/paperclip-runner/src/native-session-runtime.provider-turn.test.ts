@@ -89,7 +89,7 @@ const providerTurn = (turnId: string, options: { result?: boolean; awaiting?: bo
   event(turnId, "turn.completed", { status: "completed", error: null, ...(options.awaiting ? { awaitingProviderTurn: true } : {}) }),
 ];
 
-function harness() {
+function harness(options: { withoutInterrupt?: boolean } = {}) {
   const queue: Array<PrpEvent | "end"> = [];
   let wake: (() => void) | null = null;
   let activeProviderTurn: string | null = null;
@@ -119,7 +119,7 @@ function harness() {
       }
     },
     async startTurn() { return { turnId: "turn-1" }; },
-    interrupt,
+    ...(options.withoutInterrupt ? {} : { interrupt }),
     async result() { return null; },
     async snapshot() { return { backendKind: "mock", sessionId: identity.sessionId, identity,
       providerSessionId: "provider-session", cursor: String(sequence), activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; },
@@ -134,9 +134,18 @@ async function run(options: {
   providerTurnWait?: ProviderTurnWaitOptions;
   turnTimeoutMs?: number;
   missingResult?: (input: { turnId: string | null; terminalEvent: PrpEvent }) => PrpStructuredRunResult | null;
+  withoutInterrupt?: boolean;
+  pipelinesDeltas?: boolean;
 }) {
-  const control = harness();
+  const control = harness({ withoutInterrupt: options.withoutInterrupt });
   const appended: PrpEvent[] = [];
+  let queued: Array<() => void> = [];
+  const flushStreamingEvents = vi.fn(() => {
+    const flushed = queued;
+    queued = [];
+    for (const commit of flushed) commit();
+  });
+  let returned: Awaited<ReturnType<typeof executeNativeSession>> | null = null;
   const completeRun = vi.fn(async () => undefined);
   const resolveMissingResult = vi.fn(async (value: { turnId: string | null; terminalEvent: PrpEvent }) => options.missingResult?.(value) ?? null);
   control.push(...options.stream);
@@ -147,9 +156,11 @@ async function run(options: {
     backend: { async descriptor() { return { kind: "mock", name: "provider-turn", version: "1", capabilities }; },
       async openSession() { return control.session; } },
     controlPlane: {
+      ...(options.pipelinesDeltas ? { pipelinesStreamingEvents: true, flushStreamingEvents } : {}),
       async openRun() {}, async checkpointSession() {},
       async appendEvent(value: PrpEvent) {
         appended.push(structuredClone(value));
+        if (options.pipelinesDeltas && value.eventType === "item.delta") await new Promise<void>(resolve => queued.push(resolve));
         return { cursor: value.sourceSeq, highestContiguousSourceSeq: value.sourceSeq, disposition: "committed" };
       },
       async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
@@ -159,10 +170,11 @@ async function run(options: {
     ...(options.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: options.turnTimeoutMs }),
     resolveMissingResult,
     providerTurnWait: options.providerTurnWait,
-  }).then(() => "finalized", (error: unknown) => String(error instanceof Error ? error.message : error));
+  }).then((value) => { returned = value; return "finalized"; }, (error: unknown) => String(error instanceof Error ? error.message : error));
   await options.after?.(control, appended);
   const outcome = await execution;
-  return { outcome, appended, completeRun, resolveMissingResult, interrupt: control.interrupt, elapsedMs: Date.now() - started };
+  return { outcome, returned, appended, completeRun, resolveMissingResult, interrupt: control.interrupt, flushStreamingEvents,
+    elapsedMs: Date.now() - started };
 }
 
 const types = (events: PrpEvent[]) => events.map(value => value.eventType);
@@ -257,6 +269,24 @@ describe("the controller consumer with provider-started turn sequences", () => {
     expect(outcome.interrupt).not.toHaveBeenCalled();
     expect(outcome.resolveMissingResult).toHaveBeenCalledWith(expect.objectContaining({ turnId: "provider-1" }));
     expect(Date.now() - endedAt).toBeLessThan(1_000);
+  });
+
+  it("settles a batched delta that arrived during the idle wait before the limit ends the turn", async () => {
+    let delta!: PrpEvent;
+    const outcome = await run({
+      stream: turnOne(true), providerTurnWait: { capMs: 150 }, withoutInterrupt: true, pipelinesDeltas: true,
+      missingResult: () => result,
+      after: async (control, appended) => {
+        await waitFor(() => appended.some(value => value.payload.awaitingProviderTurn === true));
+        delta = { ...event("turn-1", "item.delta", { kind: "agentMessage", text: "late chunk" }), itemId: "message-1", priority: 1 };
+        control.push(delta);
+      },
+    });
+    expect(outcome.outcome).toBe("finalized");
+    expect(outcome.interrupt).not.toHaveBeenCalled();
+    expect(outcome.flushStreamingEvents).toHaveBeenCalled();
+    expect(outcome.appended.filter(value => value.eventType === "item.delta")).toHaveLength(1);
+    expect(outcome.returned).toMatchObject({ nativeEventCount: outcome.appended.length, highestContiguousSourceSeq: delta.sourceSeq });
   });
 
   it("never waits longer than the run's remaining timeout", async () => {
