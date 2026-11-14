@@ -802,7 +802,7 @@ export function questionResponseDeliveryService(
       });
     }
 
-    const [issue, agent, sourceRun, externalInteractionPublication] =
+    const [loadedIssue, agent, sourceRun, externalInteractionPublication] =
       await Promise.all([
         db
           .select()
@@ -858,6 +858,32 @@ export function questionResponseDeliveryService(
           .then((rows) => rows[0] ?? null),
       ]);
     const adapter = agent?.adapterType ?? "unknown";
+    let issue = loadedIssue;
+    if (
+      issue &&
+      !issue.assigneeAgentId &&
+      interaction.createdByAgentId &&
+      agent &&
+      issue.status !== "done" &&
+      issue.status !== "cancelled"
+    ) {
+      const [handedBack] = await db
+        .update(issues)
+        .set({
+          assigneeAgentId: interaction.createdByAgentId,
+          assigneeUserId: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issues.id, issue.id),
+            eq(issues.companyId, issue.companyId),
+            isNull(issues.assigneeAgentId),
+          ),
+        )
+        .returning();
+      if (handedBack) issue = handedBack;
+    }
     if (
       !issue ||
       !issue.assigneeAgentId ||

@@ -603,6 +603,31 @@ describeEmbeddedPostgres("question response delivery", () => {
     });
   });
 
+  it("hands the issue back to the asking agent when it was parked on a human", async () => {
+    const seeded = await seed({ successorStatus: "queued" });
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: null, assigneeUserId: "board-user", status: "in_review" })
+      .where(eq(issues.id, seeded.issueId));
+    const successor = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.successorRunId!))
+      .then((rows) => rows[0]!);
+    const wakeup = vi.fn().mockResolvedValue(successor);
+    const outcome = await questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    }).deliver(seeded.interaction.id);
+
+    expect(outcome.status).not.toBe("failed");
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup.mock.calls[0]?.[0]).toBe(seeded.agentId);
+    const issue = await db.select().from(issues).where(eq(issues.id, seeded.issueId)).then((rows) => rows[0]!);
+    expect(issue.assigneeAgentId).toBe(seeded.agentId);
+    expect(issue.assigneeUserId).toBeNull();
+  });
+
   it("never steers into the source run and keeps a skipped wake retryable", async () => {
     const seeded = await seed({ sourceStatus: "running" });
     const wakeup = vi.fn().mockResolvedValue(null);
